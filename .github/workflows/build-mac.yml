@@ -35,7 +35,7 @@ jobs:
         shell: bash
         run: |
           if [ -f build-mac.log ]; then
-            message="$(tail -n 80 build-mac.log | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk '{printf "%s%%0A", $0}')"
+            message="$(tail -n 30 build-mac.log | perl -pe 's/\e\[[0-9;]*m//g' | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk '{printf "%s%%0A", $0}')"
             echo "::error title=macOS build failed::$message"
           fi
 
