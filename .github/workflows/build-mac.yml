@@ -23,9 +23,29 @@ jobs:
         run: npm ci
 
       - name: Build macOS packages
+        shell: bash
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: npm run dist:mac
+        run: |
+          set -o pipefail
+          npm run dist:mac 2>&1 | tee build-mac.log
+
+      - name: Surface build error
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f build-mac.log ]; then
+            message="$(tail -n 80 build-mac.log | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk '{printf "%s%%0A", $0}')"
+            echo "::error title=macOS build failed::$message"
+          fi
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mac-build-log
+          path: build-mac.log
+          if-no-files-found: ignore
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v7
