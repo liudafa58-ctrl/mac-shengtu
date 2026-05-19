@@ -18,6 +18,7 @@ import {
   Upload,
   X
 } from "lucide-react";
+import { Capacitor } from "@capacitor/core";
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type Mode = "text" | "image";
@@ -45,6 +46,17 @@ type OutputImage = {
   src: string;
   clarity: Clarity;
   revisedPrompt?: string;
+};
+
+type ApiImageItem = {
+  b64Json?: string;
+  url?: string;
+  revisedPrompt?: string;
+};
+
+type ApiImagesResponse = {
+  images?: ApiImageItem[];
+  raw?: unknown;
 };
 
 type ServerConfig = {
@@ -78,6 +90,10 @@ const mimeByFormat: Record<string, string> = {
   jpeg: "image/jpeg",
   webp: "image/webp"
 };
+
+const FIXED_BASE_URL = "https://api.wenrugouai.cn/v1";
+const FIXED_MODEL = "gpt-image-2";
+const IS_NATIVE_APP = Capacitor.isNativePlatform();
 
 const translations = {
   zh: {
@@ -429,6 +445,207 @@ async function fetchImageObjectUrl(src: string) {
   }
 }
 
+function getNativeServerConfig(): ServerConfig {
+  return {
+    defaultBaseUrl: FIXED_BASE_URL,
+    defaultModel: FIXED_MODEL,
+    hasServerBaseUrl: true,
+    hasServerKey: false
+  };
+}
+
+async function requestServerImages(form: FormData) {
+  const response = await fetch("/api/images", {
+    method: "POST",
+    body: form
+  });
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data.message || "生成失败");
+  }
+
+  return data as ApiImagesResponse;
+}
+
+async function requestNativeImages(
+  prompt: string,
+  apiKey: string,
+  settings: StoredSettings,
+  size: string,
+  files: File[]
+) {
+  const payload = buildNativePayload(prompt, settings, size);
+  const endpoint = files.length > 0 ? "/images/edits" : "/images/generations";
+  const url = `${FIXED_BASE_URL}${endpoint}`;
+
+  if (files.length > 0) {
+    return requestNativeEditImage(url, apiKey, payload, files, settings.imageFieldName);
+  }
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+  const data = await readApiResponse(response);
+
+  if (!response.ok) {
+    throw new Error(extractApiErrorMessage(data) || "生成失败");
+  }
+
+  return {
+    images: normalizeApiImages(data),
+    raw: data
+  };
+}
+
+async function requestNativeEditImage(
+  url: string,
+  apiKey: string,
+  payload: Record<string, string | number>,
+  files: File[],
+  preferredImageFieldName: string
+) {
+  const imageFieldNames = uniqueValues([preferredImageFieldName || "image", "image", "image[]"]);
+  let lastMessage = "";
+
+  for (const imageFieldName of imageFieldNames) {
+    const form = new FormData();
+    Object.entries(payload).forEach(([key, value]) => {
+      form.append(key, String(value));
+    });
+    files.forEach((file, index) => {
+      form.append(imageFieldName, file, safeImageFilename(file, index));
+    });
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: form
+    });
+    const data = await readApiResponse(response);
+
+    if (response.ok) {
+      return {
+        images: normalizeApiImages(data),
+        raw: data
+      };
+    }
+
+    lastMessage = extractApiErrorMessage(data) || `图生图请求失败（${response.status}）`;
+    if (!shouldRetryEditStatus(response.status)) {
+      throw new Error(lastMessage);
+    }
+  }
+
+  throw new Error(lastMessage || "图生图请求失败");
+}
+
+function buildNativePayload(prompt: string, settings: StoredSettings, size: string) {
+  const payload: Record<string, string | number> = {
+    model: FIXED_MODEL,
+    prompt,
+    size,
+    quality: settings.quality || "auto",
+    background: settings.background || "auto",
+    output_format: settings.outputFormat || "png",
+    n: Math.min(Math.max(Math.round(Number(settings.n) || 1), 1), 4)
+  };
+
+  if ((settings.outputFormat === "jpeg" || settings.outputFormat === "webp") && Number.isFinite(settings.outputCompression)) {
+    payload.output_compression = Math.min(Math.max(Math.round(settings.outputCompression), 0), 100);
+  }
+
+  return dropEmptyNativeValues(payload);
+}
+
+async function readApiResponse(response: Response) {
+  const text = await response.text();
+  if (!text) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
+function normalizeApiImages(data: unknown): ApiImageItem[] {
+  if (!data || typeof data !== "object") {
+    return [];
+  }
+
+  const record = data as Record<string, unknown>;
+  const items = Array.isArray(record.data) ? record.data : [];
+  return items
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    .map((item) => ({
+      b64Json: readString(item.b64_json),
+      url: readString(item.url),
+      revisedPrompt: readString(item.revised_prompt)
+    }))
+    .filter((item) => item.b64Json || item.url);
+}
+
+function extractApiErrorMessage(data: unknown) {
+  if (typeof data === "string") {
+    return data;
+  }
+  if (!data || typeof data !== "object") {
+    return "";
+  }
+
+  const record = data as Record<string, unknown>;
+  const error = record.error;
+  if (error && typeof error === "object") {
+    return readString((error as Record<string, unknown>).message);
+  }
+
+  return readString(record.message);
+}
+
+function readString(value: unknown) {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return "";
+}
+
+function shouldRetryEditStatus(status: number) {
+  return status === 400 || status === 404 || status === 415 || status === 422;
+}
+
+function safeImageFilename(file: File, index: number) {
+  const extensionByMime: Record<string, string> = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp"
+  };
+  return `reference-${index + 1}.${extensionByMime[file.type] || "png"}`;
+}
+
+function uniqueValues(values: string[]) {
+  return values.filter((value, index, array) => value && array.indexOf(value) === index);
+}
+
+function dropEmptyNativeValues<T extends Record<string, unknown>>(record: T) {
+  return Object.fromEntries(
+    Object.entries(record).filter(([, value]) => value !== "" && value !== undefined && value !== null)
+  ) as T;
+}
+
 function App() {
   const [serverConfig, setServerConfig] = useState<ServerConfig | null>(null);
   const [language, setLanguage] = useState<Language>(() => {
@@ -506,6 +723,18 @@ function App() {
       } catch {
         localStorage.removeItem(SETTINGS_KEY);
       }
+    }
+
+    if (IS_NATIVE_APP) {
+      const config = getNativeServerConfig();
+      setServerConfig(config);
+      setSettings((current) => ({
+        ...current,
+        baseUrl: config.defaultBaseUrl,
+        model: config.defaultModel
+      }));
+      setStatus({ kind: "ready" });
+      return;
     }
 
     fetch("/api/config")
@@ -603,17 +832,11 @@ function App() {
     }
 
     try {
-      const response = await fetch("/api/images", {
-        method: "POST",
-        body: form
-      });
-      const data = await response.json();
+      const data = IS_NATIVE_APP
+        ? await requestNativeImages(prompt.trim(), apiKey.trim(), settings, selectedSizePreset.apiSize, files)
+        : await requestServerImages(form);
 
-      if (!response.ok) {
-        throw new Error(data.message || text.status.generateFailed);
-      }
-
-      const rawOutputs = (data.images || []).map((image: { b64Json?: string; url?: string; revisedPrompt?: string }) => {
+      const rawOutputs = (data.images || []).map((image: ApiImageItem) => {
         const src = image.b64Json
           ? `data:${mimeByFormat[settings.outputFormat] || "image/png"};base64,${image.b64Json}`
           : image.url || "";

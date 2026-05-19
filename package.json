@@ -12,6 +12,8 @@
     "desktop": "npm run build && electron .",
     "dist:win": "npm run build && electron-builder --win nsis --x64",
     "dist:mac": "npm run build && electron-builder --mac dmg zip --universal --publish never",
+    "android:sync": "npm run build && cap sync android",
+    "dist:android": "npm run android:sync && cd android && gradlew.bat assembleDebug",
     "start": "node dist-server/index.js",
     "preview": "vite preview --host 127.0.0.1"
   },
@@ -83,6 +85,7 @@
     }
   },
   "dependencies": {
+    "@capacitor/core": "^8.3.4",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "lucide-react": "^0.561.0",
@@ -91,6 +94,8 @@
     "react-dom": "^19.2.3"
   },
   "devDependencies": {
+    "@capacitor/android": "^8.3.4",
+    "@capacitor/cli": "^8.3.4",
     "@types/express": "^5.0.6",
     "@types/multer": "^2.0.0",
     "@types/node": "^25.0.3",

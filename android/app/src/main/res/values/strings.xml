@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">稳如狗生图工作台V1.0</string>
+    <string name="title_activity_main">稳如狗生图工作台V1.0</string>
+    <string name="package_name">cn.wenrugou.imagestudio</string>
+    <string name="custom_url_scheme">cn.wenrugou.imagestudio</string>
+</resources>
