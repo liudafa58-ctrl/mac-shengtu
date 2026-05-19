@@ -164,18 +164,50 @@ async function forwardEditRequest(
   files: Express.Multer.File[],
   fields: UnknownRecord
 ) {
+  const preferredImageFieldName = readField(fields.imageFieldName) || process.env.IMAGE_EDIT_IMAGE_FIELD || "image";
+  const imageFieldNames = uniqueValues([preferredImageFieldName, "image", "image[]"]);
+  let lastResponse: Response | null = null;
+  let lastError: Error | null = null;
+
+  for (const imageFieldName of imageFieldNames) {
+    try {
+      const response = await sendEditRequest(url, apiKey, payload, files, imageFieldName);
+
+      if (response.ok || !shouldRetryEditRequest(response.status)) {
+        return response;
+      }
+
+      lastResponse = response;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
+  if (lastResponse) {
+    return lastResponse;
+  }
+
+  throw new Error(`图生图请求失败：无法连接中转站${lastError?.message ? `（${lastError.message}）` : ""}`);
+}
+
+async function sendEditRequest(
+  url: string,
+  apiKey: string,
+  payload: UpstreamRequest,
+  files: Express.Multer.File[],
+  imageFieldName: string
+) {
   const form = new FormData();
-  const imageFieldName = readField(fields.imageFieldName) || process.env.IMAGE_EDIT_IMAGE_FIELD || "image[]";
 
   Object.entries(payload).forEach(([key, value]) => {
     form.append(key, String(value));
   });
 
-  files.forEach((file) => {
+  files.forEach((file, index) => {
     const blob = new Blob([new Uint8Array(file.buffer)], {
       type: file.mimetype || "application/octet-stream"
     });
-    form.append(imageFieldName, blob, file.originalname || "reference.png");
+    form.append(imageFieldName, blob, safeImageFilename(file, index));
   });
 
   return fetch(url, {
@@ -185,6 +217,25 @@ async function forwardEditRequest(
     },
     body: form
   });
+}
+
+function shouldRetryEditRequest(status: number) {
+  return status === 400 || status === 404 || status === 415 || status === 422;
+}
+
+function safeImageFilename(file: Express.Multer.File, index: number) {
+  const extensionByMime: Record<string, string> = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp"
+  };
+  const extension = extensionByMime[file.mimetype] || "png";
+  return `reference-${index + 1}.${extension}`;
+}
+
+function uniqueValues(values: string[]) {
+  return values.filter((value, index, array) => value && array.indexOf(value) === index);
 }
 
 function normalizeBaseUrl(value: string) {

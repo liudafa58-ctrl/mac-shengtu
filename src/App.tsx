@@ -326,7 +326,7 @@ const defaultSettings: StoredSettings = {
   outputFormat: "png",
   outputCompression: 80,
   n: 1,
-  imageFieldName: "image[]",
+  imageFieldName: "image",
   rememberKey: false
 };
 
