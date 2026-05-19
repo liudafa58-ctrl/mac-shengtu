@@ -11,7 +11,7 @@
     "build": "tsc -p tsconfig.server.json && tsc -p tsconfig.json && vite build",
     "desktop": "npm run build && electron .",
     "dist:win": "npm run build && electron-builder --win nsis --x64",
-    "dist:mac": "npm run build && electron-builder --mac dmg zip --universal",
+    "dist:mac": "npm run build && electron-builder --mac dmg zip --universal --publish never",
     "start": "node dist-server/index.js",
     "preview": "vite preview --host 127.0.0.1"
   },
