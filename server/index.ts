@@ -197,26 +197,60 @@ async function sendEditRequest(
   files: Express.Multer.File[],
   imageFieldName: string
 ) {
-  const form = new FormData();
-
-  Object.entries(payload).forEach(([key, value]) => {
-    form.append(key, String(value));
-  });
-
-  files.forEach((file, index) => {
-    const blob = new Blob([new Uint8Array(file.buffer)], {
-      type: file.mimetype || "application/octet-stream"
-    });
-    form.append(imageFieldName, blob, safeImageFilename(file, index));
-  });
+  const multipart = buildMultipartBody(payload, files, imageFieldName);
 
   return fetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiKey}`
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": multipart.contentType,
+      "Content-Length": String(multipart.body.length)
     },
-    body: form
+    body: multipart.body
   });
+}
+
+function buildMultipartBody(payload: UpstreamRequest, files: Express.Multer.File[], imageFieldName: string) {
+  const boundary = `----wenrugou-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const chunks: Buffer[] = [];
+
+  Object.entries(payload).forEach(([key, value]) => {
+    chunks.push(
+      Buffer.from(
+        `--${boundary}\r\n` +
+          `Content-Disposition: form-data; name="${escapeMultipartHeader(key)}"\r\n\r\n` +
+          `${String(value)}\r\n`,
+        "utf8"
+      )
+    );
+  });
+
+  files.forEach((file, index) => {
+    chunks.push(
+      Buffer.from(
+        `--${boundary}\r\n` +
+          `Content-Disposition: form-data; name="${escapeMultipartHeader(imageFieldName)}"; filename="${safeImageFilename(
+            file,
+            index
+          )}"\r\n` +
+          `Content-Type: ${file.mimetype || "application/octet-stream"}\r\n\r\n`,
+        "utf8"
+      )
+    );
+    chunks.push(file.buffer);
+    chunks.push(Buffer.from("\r\n", "utf8"));
+  });
+
+  chunks.push(Buffer.from(`--${boundary}--\r\n`, "utf8"));
+
+  return {
+    body: Buffer.concat(chunks),
+    contentType: `multipart/form-data; boundary=${boundary}`
+  };
+}
+
+function escapeMultipartHeader(value: string) {
+  return value.replace(/[\r\n"]/g, "_");
 }
 
 function shouldRetryEditRequest(status: number) {
