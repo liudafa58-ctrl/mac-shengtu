@@ -2,6 +2,8 @@ import "dotenv/config";
 
 import express from "express";
 import multer from "multer";
+import { request as requestHttp } from "node:http";
+import { request as requestHttps } from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,6 +29,11 @@ type UpstreamRequest = {
   output_format?: string;
   output_compression?: number;
   n?: number;
+};
+
+type MultipartBody = {
+  body: Buffer;
+  contentType: string;
 };
 
 const app = express();
@@ -198,7 +205,25 @@ async function sendEditRequest(
   imageFieldName: string
 ) {
   const multipart = buildMultipartBody(payload, files, imageFieldName);
+  let fetchError: Error | null = null;
 
+  try {
+    return await sendMultipartWithFetch(url, apiKey, multipart);
+  } catch (error) {
+    fetchError = normalizeError(error);
+  }
+
+  try {
+    return await sendMultipartWithNodeRequest(url, apiKey, multipart);
+  } catch (error) {
+    const nodeRequestError = normalizeError(error);
+    throw new Error(
+      `fetch failed: ${describeError(fetchError)}; node https failed: ${describeError(nodeRequestError)}`
+    );
+  }
+}
+
+function sendMultipartWithFetch(url: string, apiKey: string, multipart: MultipartBody) {
   return fetch(url, {
     method: "POST",
     headers: {
@@ -206,11 +231,52 @@ async function sendEditRequest(
       "Content-Type": multipart.contentType,
       "Content-Length": String(multipart.body.length)
     },
-    body: multipart.body
+    body: new Uint8Array(multipart.body)
   });
 }
 
-function buildMultipartBody(payload: UpstreamRequest, files: Express.Multer.File[], imageFieldName: string) {
+function sendMultipartWithNodeRequest(url: string, apiKey: string, multipart: MultipartBody) {
+  return new Promise<Response>((resolve, reject) => {
+    const endpoint = new URL(url);
+    const client = endpoint.protocol === "http:" ? requestHttp : requestHttps;
+    const request = client(
+      endpoint,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": multipart.contentType,
+          "Content-Length": String(multipart.body.length)
+        },
+        timeout: 180000
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+
+        response.on("data", (chunk: Buffer | string) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+
+        response.on("end", () => {
+          resolve(
+            new Response(Buffer.concat(chunks), {
+              status: response.statusCode || 500,
+              headers: response.headers as HeadersInit
+            })
+          );
+        });
+      }
+    );
+
+    request.on("timeout", () => {
+      request.destroy(new Error("request timeout"));
+    });
+    request.on("error", reject);
+    request.end(multipart.body);
+  });
+}
+
+function buildMultipartBody(payload: UpstreamRequest, files: Express.Multer.File[], imageFieldName: string): MultipartBody {
   const boundary = `----wenrugou-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const chunks: Buffer[] = [];
 
@@ -251,6 +317,23 @@ function buildMultipartBody(payload: UpstreamRequest, files: Express.Multer.File
 
 function escapeMultipartHeader(value: string) {
   return value.replace(/[\r\n"]/g, "_");
+}
+
+function normalizeError(error: unknown) {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function describeError(error: Error | null) {
+  if (!error) {
+    return "unknown";
+  }
+
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (cause instanceof Error && cause.message) {
+    return `${error.message} (${cause.message})`;
+  }
+
+  return error.message;
 }
 
 function shouldRetryEditRequest(status: number) {
