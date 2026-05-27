@@ -3,7 +3,9 @@ import {
   Brush,
   CheckCircle2,
   Copy,
+  Eye,
   ExternalLink,
+  History,
   ImagePlus,
   KeyRound,
   Languages,
@@ -15,13 +17,15 @@ import {
   Settings2,
   Sparkles,
   Sun,
+  Trash2,
   Upload,
   X
 } from "lucide-react";
-import { Capacitor } from "@capacitor/core";
+import { Capacitor, registerPlugin } from "@capacitor/core";
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type Mode = "text" | "image";
+type ActivePage = "studio" | "history";
 type Language = "zh" | "en";
 type Theme = "light" | "dark";
 type Clarity = "original" | "2k" | "4k";
@@ -34,6 +38,7 @@ type StatusKind =
   | "completed"
   | "emptyResponse"
   | "generateFailed"
+  | "downloadSaved"
   | "promptCopied";
 
 type StatusState = {
@@ -45,7 +50,21 @@ type OutputImage = {
   id: string;
   src: string;
   clarity: Clarity;
+  format?: string;
   revisedPrompt?: string;
+};
+
+type HistoryRecord = {
+  id: string;
+  createdAt: number;
+  prompt: string;
+  mode: Mode;
+  size: string;
+  clarity: Clarity;
+  quality: string;
+  background: string;
+  count: number;
+  images: OutputImage[];
 };
 
 type ApiImageItem = {
@@ -57,6 +76,15 @@ type ApiImageItem = {
 type ApiImagesResponse = {
   images?: ApiImageItem[];
   raw?: unknown;
+};
+
+type GallerySaverPlugin = {
+  saveImage(options: {
+    base64?: string;
+    url?: string;
+    mimeType: string;
+    fileName: string;
+  }): Promise<{ uri: string; path?: string }>;
 };
 
 type ServerConfig = {
@@ -84,6 +112,9 @@ type StoredSettings = {
 const SETTINGS_KEY = "gpt-image-studio-settings";
 const LANGUAGE_KEY = "gpt-image-studio-language";
 const THEME_KEY = "gpt-image-studio-theme";
+const HISTORY_DB_NAME = "wenrugou-image-history";
+const HISTORY_STORE_NAME = "records";
+const MAX_HISTORY_RECORDS = 20;
 
 const mimeByFormat: Record<string, string> = {
   png: "image/png",
@@ -94,6 +125,8 @@ const mimeByFormat: Record<string, string> = {
 const FIXED_BASE_URL = "https://api.wenrugouai.cn/v1";
 const FIXED_MODEL = "gpt-image-2";
 const IS_NATIVE_APP = Capacitor.isNativePlatform();
+const IS_ANDROID_NATIVE = IS_NATIVE_APP && Capacitor.getPlatform() === "android";
+const GallerySaver = registerPlugin<GallerySaverPlugin>("GallerySaver");
 
 const translations = {
   zh: {
@@ -138,10 +171,20 @@ const translations = {
     waiting: "等待生成",
     generatingShort: "生成中",
     download: "下载",
+    saveToGallery: "保存到手机相册",
+    downloadFailed: "保存失败，请稍后重试",
     copyRevised: "复制修订提示词",
     previewImage: "预览图片",
     closePreview: "关闭预览",
     backToOfficial: "返回官网",
+    history: "生成历史",
+    historyButton: "历史记录",
+    backToStudio: "返回生成",
+    historyEmpty: "暂无历史记录",
+    clearHistory: "清空历史",
+    deleteHistory: "删除记录",
+    openHistory: "查看这次生成",
+    historyImageCount: (count: number) => `${count} 张`,
     status: {
       ready: "链接成功",
       serviceDisconnected: "接口服务未连接",
@@ -150,6 +193,7 @@ const translations = {
       enhancingImage: "正在优化清晰度",
       emptyResponse: "接口返回为空",
       generateFailed: "生成失败",
+      downloadSaved: "已保存到手机相册",
       promptCopied: "提示词已复制",
       completed: (count: number) => `完成 ${count} 张`
     },
@@ -212,10 +256,20 @@ const translations = {
     waiting: "Waiting",
     generatingShort: "Generating",
     download: "Download",
+    saveToGallery: "Save to gallery",
+    downloadFailed: "Save failed, please try again",
     copyRevised: "Copy revised prompt",
     previewImage: "Preview image",
     closePreview: "Close preview",
     backToOfficial: "Official site",
+    history: "History",
+    historyButton: "History",
+    backToStudio: "Back to studio",
+    historyEmpty: "No history yet",
+    clearHistory: "Clear history",
+    deleteHistory: "Delete record",
+    openHistory: "View this generation",
+    historyImageCount: (count: number) => `${count} image${count === 1 ? "" : "s"}`,
     status: {
       ready: "Connected",
       serviceDisconnected: "API service disconnected",
@@ -224,6 +278,7 @@ const translations = {
       enhancingImage: "Enhancing clarity",
       emptyResponse: "API returned no images",
       generateFailed: "Generation failed",
+      downloadSaved: "Saved to phone gallery",
       promptCopied: "Prompt copied",
       completed: (count: number) => `Completed ${count} image${count === 1 ? "" : "s"}`
     },
@@ -478,11 +533,62 @@ async function requestNativeImages(
   const payload = buildNativePayload(prompt, settings, size);
   const endpoint = files.length > 0 ? "/images/edits" : "/images/generations";
   const url = `${FIXED_BASE_URL}${endpoint}`;
+  const requestedCount = clampImageCount(settings.n);
 
-  if (files.length > 0) {
-    return requestNativeEditImage(url, apiKey, payload, files, settings.imageFieldName);
+  return requestNativeImagesWithCount(url, apiKey, payload, requestedCount, files, settings.imageFieldName);
+}
+
+async function requestNativeImagesWithCount(
+  url: string,
+  apiKey: string,
+  payload: Record<string, string | number>,
+  requestedCount: number,
+  files: File[],
+  imageFieldName: string
+): Promise<ApiImagesResponse> {
+  const images: ApiImageItem[] = [];
+  const raw: unknown[] = [];
+  const maxAttempts = requestedCount + 2;
+  let attempts = 0;
+  let emptyResponses = 0;
+
+  while (images.length < requestedCount && attempts < maxAttempts) {
+    attempts += 1;
+    const singlePayload = { ...payload, n: 1 };
+    const result =
+      files.length > 0
+        ? await requestNativeEditImage(url, apiKey, singlePayload, files, imageFieldName)
+        : await requestNativeGenerationImage(url, apiKey, singlePayload);
+
+    raw.push(result.raw);
+
+    if (!result.images?.length) {
+      emptyResponses += 1;
+      if (emptyResponses >= 2) {
+        break;
+      }
+      continue;
+    }
+
+    emptyResponses = 0;
+    images.push(...result.images);
   }
 
+  if (images.length < requestedCount) {
+    throw new Error(`图片接口只返回 ${images.length} 张，未达到本次要求的 ${requestedCount} 张，请稍后重试`);
+  }
+
+  return {
+    images: images.slice(0, requestedCount),
+    raw
+  };
+}
+
+async function requestNativeGenerationImage(
+  url: string,
+  apiKey: string,
+  payload: Record<string, string | number>
+): Promise<ApiImagesResponse> {
   const response = await fetch(url, {
     method: "POST",
     headers: {
@@ -555,7 +661,7 @@ function buildNativePayload(prompt: string, settings: StoredSettings, size: stri
     quality: settings.quality || "auto",
     background: settings.background || "auto",
     output_format: settings.outputFormat || "png",
-    n: Math.min(Math.max(Math.round(Number(settings.n) || 1), 1), 4)
+    n: clampImageCount(settings.n)
   };
 
   if ((settings.outputFormat === "jpeg" || settings.outputFormat === "webp") && Number.isFinite(settings.outputCompression)) {
@@ -563,6 +669,14 @@ function buildNativePayload(prompt: string, settings: StoredSettings, size: stri
   }
 
   return dropEmptyNativeValues(payload);
+}
+
+function clampImageCount(value: number) {
+  if (!Number.isFinite(value)) {
+    return 1;
+  }
+
+  return Math.min(Math.max(Math.round(value), 1), 4);
 }
 
 async function readApiResponse(response: Response) {
@@ -646,6 +760,182 @@ function dropEmptyNativeValues<T extends Record<string, unknown>>(record: T) {
   ) as T;
 }
 
+async function saveImageToAndroidGallery(src: string, fileName: string, fallbackMimeType: string) {
+  if (src.startsWith("data:")) {
+    const dataUrlParts = src.match(/^data:([^;]+);base64,(.+)$/);
+    if (!dataUrlParts) {
+      throw new Error("Invalid image data");
+    }
+
+    await GallerySaver.saveImage({
+      base64: dataUrlParts[2],
+      mimeType: dataUrlParts[1] || fallbackMimeType,
+      fileName
+    });
+    return;
+  }
+
+  await GallerySaver.saveImage({
+    url: src,
+    mimeType: fallbackMimeType,
+    fileName
+  });
+}
+
+function openHistoryDb() {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    if (!window.indexedDB) {
+      reject(new Error("IndexedDB is not available"));
+      return;
+    }
+
+    const request = window.indexedDB.open(HISTORY_DB_NAME, 1);
+
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(HISTORY_STORE_NAME)) {
+        db.createObjectStore(HISTORY_STORE_NAME, { keyPath: "id" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("History database failed"));
+  });
+}
+
+async function loadHistoryRecords() {
+  const db = await openHistoryDb();
+
+  return new Promise<HistoryRecord[]>((resolve, reject) => {
+    const transaction = db.transaction(HISTORY_STORE_NAME, "readonly");
+    const store = transaction.objectStore(HISTORY_STORE_NAME);
+    const request = store.getAll();
+
+    request.onsuccess = () => {
+      const records = (request.result as HistoryRecord[])
+        .filter((record) => record && Array.isArray(record.images))
+        .sort((left, right) => right.createdAt - left.createdAt);
+      resolve(records);
+    };
+    request.onerror = () => reject(request.error || new Error("History loading failed"));
+    transaction.oncomplete = () => db.close();
+    transaction.onerror = () => reject(transaction.error || new Error("History loading failed"));
+  });
+}
+
+async function putHistoryRecord(record: HistoryRecord) {
+  const db = await openHistoryDb();
+
+  return new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(HISTORY_STORE_NAME, "readwrite");
+    transaction.objectStore(HISTORY_STORE_NAME).put(record);
+    transaction.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    transaction.onerror = () => reject(transaction.error || new Error("History saving failed"));
+  });
+}
+
+async function deleteHistoryRecord(id: string) {
+  const db = await openHistoryDb();
+
+  return new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(HISTORY_STORE_NAME, "readwrite");
+    transaction.objectStore(HISTORY_STORE_NAME).delete(id);
+    transaction.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    transaction.onerror = () => reject(transaction.error || new Error("History deleting failed"));
+  });
+}
+
+async function clearHistoryRecords() {
+  const db = await openHistoryDb();
+
+  return new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(HISTORY_STORE_NAME, "readwrite");
+    transaction.objectStore(HISTORY_STORE_NAME).clear();
+    transaction.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    transaction.onerror = () => reject(transaction.error || new Error("History clearing failed"));
+  });
+}
+
+async function saveHistoryRecord(record: HistoryRecord) {
+  await putHistoryRecord(record);
+  const records = await loadHistoryRecords();
+  const expiredRecords = records.slice(MAX_HISTORY_RECORDS);
+  await Promise.all(expiredRecords.map((expiredRecord) => deleteHistoryRecord(expiredRecord.id)));
+  return records.slice(0, MAX_HISTORY_RECORDS);
+}
+
+async function createHistoryRecord(
+  prompt: string,
+  mode: Mode,
+  settings: StoredSettings,
+  size: string,
+  images: OutputImage[]
+): Promise<HistoryRecord> {
+  const historyImages = await Promise.all(
+    images.map(async (image) => ({
+      ...image,
+      src: await imageSrcToDataUrl(image.src)
+    }))
+  );
+
+  return {
+    id: crypto.randomUUID(),
+    createdAt: Date.now(),
+    prompt,
+    mode,
+    size,
+    clarity: settings.clarity,
+    quality: settings.quality,
+    background: settings.background,
+    count: historyImages.length,
+    images: historyImages
+  };
+}
+
+async function imageSrcToDataUrl(src: string) {
+  if (src.startsWith("data:")) {
+    return src;
+  }
+
+  try {
+    const response = await fetch(src);
+    if (!response.ok) {
+      return src;
+    }
+
+    const blob = await response.blob();
+    return await blobToDataUrl(blob);
+  } catch {
+    return src;
+  }
+}
+
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("Image conversion failed"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function formatHistoryTime(timestamp: number, language: Language) {
+  return new Intl.DateTimeFormat(language === "zh" ? "zh-CN" : "en-US", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(new Date(timestamp));
+}
+
 function App() {
   const [serverConfig, setServerConfig] = useState<ServerConfig | null>(null);
   const [language, setLanguage] = useState<Language>(() => {
@@ -656,6 +946,7 @@ function App() {
     const storedTheme = localStorage.getItem(THEME_KEY);
     return storedTheme === "dark" ? "dark" : "light";
   });
+  const [activePage, setActivePage] = useState<ActivePage>("studio");
   const [mode, setMode] = useState<Mode>("image");
   const [prompt, setPrompt] = useState("");
   const [settings, setSettings] = useState<StoredSettings>(defaultSettings);
@@ -668,10 +959,12 @@ function App() {
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState<StatusState>({ kind: "ready" });
   const [error, setError] = useState("");
+  const [historyRecords, setHistoryRecords] = useState<HistoryRecord[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const text = translations[language];
   const statusText =
     status.kind === "completed" ? text.status.completed(status.count || 0) : text.status[status.kind];
+  const downloadText = IS_ANDROID_NATIVE ? text.saveToGallery : text.download;
   const selectedSizePreset =
     sizePresets.find((preset) => preset.id === settings.size) || sizePresets.find((preset) => preset.id === "square")!;
 
@@ -687,6 +980,26 @@ function App() {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    loadHistoryRecords()
+      .then((records) => {
+        if (isMounted) {
+          setHistoryRecords(records.slice(0, MAX_HISTORY_RECORDS));
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setHistoryRecords([]);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!isGenerating) {
@@ -805,19 +1118,52 @@ function App() {
     addFiles(event.dataTransfer.files);
   }
 
+  async function persistGenerationHistory(promptText: string, images: OutputImage[]) {
+    if (images.length === 0) {
+      return;
+    }
+
+    try {
+      const record = await createHistoryRecord(promptText, mode, settings, selectedSizePreset.apiSize, images);
+      const records = await saveHistoryRecord(record);
+      setHistoryRecords(records.slice(0, MAX_HISTORY_RECORDS));
+    } catch {
+      // History is a convenience feature; generation should still succeed if local storage is full.
+    }
+  }
+
+  async function removeHistoryRecord(id: string) {
+    try {
+      await deleteHistoryRecord(id);
+      setHistoryRecords((current) => current.filter((record) => record.id !== id));
+    } catch {
+      setHistoryRecords((current) => current.filter((record) => record.id !== id));
+    }
+  }
+
+  async function removeAllHistoryRecords() {
+    try {
+      await clearHistoryRecords();
+    } finally {
+      setHistoryRecords([]);
+    }
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!canSubmit) {
       return;
     }
 
+    const promptText = prompt.trim();
+    setActivePage("studio");
     setIsGenerating(true);
     setProgress(8);
     setError("");
     setStatus({ kind: mode === "image" ? "processingRefs" : "generatingImage" });
 
     const form = new FormData();
-    form.set("prompt", prompt.trim());
+    form.set("prompt", promptText);
     form.set("apiKey", apiKey.trim());
     form.set("size", selectedSizePreset.apiSize);
     form.set("quality", settings.quality);
@@ -833,7 +1179,7 @@ function App() {
 
     try {
       const data = IS_NATIVE_APP
-        ? await requestNativeImages(prompt.trim(), apiKey.trim(), settings, selectedSizePreset.apiSize, files)
+        ? await requestNativeImages(promptText, apiKey.trim(), settings, selectedSizePreset.apiSize, files)
         : await requestServerImages(form);
 
       const rawOutputs = (data.images || []).map((image: ApiImageItem) => {
@@ -845,6 +1191,7 @@ function App() {
           id: crypto.randomUUID(),
           src,
           clarity: settings.clarity,
+          format: settings.outputFormat,
           revisedPrompt: image.revisedPrompt
         };
       });
@@ -869,6 +1216,7 @@ function App() {
       setOutputs(nextOutputs);
       setProgress(100);
       setStatus(nextOutputs.length ? { kind: "completed", count: nextOutputs.length } : { kind: "emptyResponse" });
+      void persistGenerationHistory(promptText, nextOutputs);
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : text.status.generateFailed;
       setError(message);
@@ -880,15 +1228,29 @@ function App() {
   }
 
   async function downloadImage(image: OutputImage, index: number) {
-    const extension = settings.outputFormat === "jpeg" ? "jpg" : settings.outputFormat;
-    const response = await fetch(image.src);
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `wenrugou-image-${image.clarity}-${index + 1}.${extension}`;
-    link.click();
-    URL.revokeObjectURL(url);
+    const imageFormat = image.format || settings.outputFormat;
+    const extension = imageFormat === "jpeg" ? "jpg" : imageFormat;
+    const fileName = `wenrugou-image-${image.clarity}-${Date.now()}-${index + 1}.${extension}`;
+
+    try {
+      if (IS_ANDROID_NATIVE) {
+        await saveImageToAndroidGallery(image.src, fileName, mimeByFormat[imageFormat] || "image/png");
+        setError("");
+        setStatus({ kind: "downloadSaved" });
+        return;
+      }
+
+      const response = await fetch(image.src);
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = fileName;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      setError(text.downloadFailed);
+    }
   }
 
   async function copyPrompt(value: string) {
@@ -1084,7 +1446,10 @@ function App() {
             <button
               type="button"
               className={mode === "text" ? "active" : ""}
-              onClick={() => setMode("text")}
+              onClick={() => {
+                setActivePage("studio");
+                setMode("text");
+              }}
               role="tab"
               aria-selected={mode === "text"}
             >
@@ -1094,7 +1459,10 @@ function App() {
             <button
               type="button"
               className={mode === "image" ? "active" : ""}
-              onClick={() => setMode("image")}
+              onClick={() => {
+                setActivePage("studio");
+                setMode("image");
+              }}
               role="tab"
               aria-selected={mode === "image"}
             >
@@ -1102,6 +1470,15 @@ function App() {
               {text.imageToImage}
             </button>
           </div>
+
+          <button
+            type="button"
+            className={`history-nav-button ${activePage === "history" ? "active" : ""}`}
+            onClick={() => setActivePage((current) => (current === "history" ? "studio" : "history"))}
+          >
+            <History size={18} />
+            {activePage === "history" ? text.backToStudio : text.historyButton}
+          </button>
 
           <div className="actions">
             <a
@@ -1148,6 +1525,7 @@ function App() {
               aria-label={text.clear}
               onClick={() => {
                 setPrompt("");
+                setActivePage("studio");
                 setFiles([]);
                 setOutputs([]);
                 setPreviewImage(null);
@@ -1165,6 +1543,86 @@ function App() {
           </div>
         </header>
 
+        {activePage === "history" ? (
+          <section className="history-page">
+            <div className="history-heading">
+              <div className="section-title">
+                <History size={18} />
+                <h2>{text.history}</h2>
+              </div>
+              {historyRecords.length > 0 && (
+                <button type="button" className="history-clear" onClick={removeAllHistoryRecords}>
+                  <Trash2 size={16} />
+                  {text.clearHistory}
+                </button>
+              )}
+            </div>
+
+            {historyRecords.length === 0 ? (
+              <div className="history-empty">{text.historyEmpty}</div>
+            ) : (
+              <div className="history-list">
+                {historyRecords.map((record) => (
+                  <article className="history-card" key={record.id}>
+                    <div className="history-info">
+                      <div>
+                        <strong>{record.prompt}</strong>
+                        <small>
+                          {formatHistoryTime(record.createdAt, language)} · {text.historyImageCount(record.count)}
+                        </small>
+                        <small>
+                          {record.mode === "image" ? text.imageToImage : text.textToImage} · {record.size}
+                        </small>
+                      </div>
+                      <button
+                        type="button"
+                        className="history-delete"
+                        title={text.deleteHistory}
+                        aria-label={text.deleteHistory}
+                        onClick={() => removeHistoryRecord(record.id)}
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                    <div className="history-images">
+                      {record.images.map((image, imageIndex) => (
+                        <div className="history-image-card" key={`${record.id}-${image.id}-${imageIndex}`}>
+                          <button
+                            type="button"
+                            className="history-image-preview"
+                            aria-label={text.previewImage}
+                            onClick={() => setPreviewImage(image)}
+                          >
+                            <img src={image.src} alt={text.outputAlt(imageIndex)} />
+                          </button>
+                          <div className="history-image-actions">
+                            <button
+                              type="button"
+                              title={text.previewImage}
+                              aria-label={text.previewImage}
+                              onClick={() => setPreviewImage(image)}
+                            >
+                              <Eye size={16} />
+                            </button>
+                            <button
+                              type="button"
+                              title={downloadText}
+                              aria-label={downloadText}
+                              onClick={() => downloadImage(image, imageIndex)}
+                            >
+                              <ArrowDownToLine size={16} />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+        ) : (
+          <>
         <section className="prompt-zone">
           <div className="prompt-header">
             <div>
@@ -1284,7 +1742,7 @@ function App() {
                     <img src={image.src} alt={text.outputAlt(index)} />
                   </button>
                   <div className="result-tools">
-                    <button type="button" title={text.download} aria-label={text.download} onClick={() => downloadImage(image, index)}>
+                    <button type="button" title={downloadText} aria-label={downloadText} onClick={() => downloadImage(image, index)}>
                       <ArrowDownToLine size={17} />
                     </button>
                     {image.revisedPrompt && (
@@ -1303,6 +1761,8 @@ function App() {
             )}
           </div>
         </section>
+          </>
+        )}
       </form>
 
       {previewImage && (
@@ -1317,7 +1777,7 @@ function App() {
             <div className="preview-toolbar">
               <span>{text.previewImage}</span>
               <div>
-                <button type="button" title={text.download} aria-label={text.download} onClick={() => downloadImage(previewImage, 0)}>
+                <button type="button" title={downloadText} aria-label={downloadText} onClick={() => downloadImage(previewImage, 0)}>
                   <ArrowDownToLine size={18} />
                 </button>
                 <button type="button" title={text.closePreview} aria-label={text.closePreview} onClick={() => setPreviewImage(null)}>

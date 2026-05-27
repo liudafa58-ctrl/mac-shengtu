@@ -36,6 +36,22 @@ type MultipartBody = {
   contentType: string;
 };
 
+type ImageRequestResult = {
+  images: NormalizedImage[];
+  raw: unknown[];
+};
+
+class UpstreamHttpError extends Error {
+  status: number;
+  upstream: unknown;
+
+  constructor(message: string, status: number, upstream: unknown) {
+    super(message);
+    this.status = status;
+    this.upstream = upstream;
+  }
+}
+
 const app = express();
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -79,30 +95,32 @@ app.post("/api/images", upload.array("images", 8), async (req, res) => {
     const endpoint = files.length > 0 ? "/images/edits" : "/images/generations";
     const payload = buildPayload(fields, prompt);
     const upstreamUrl = `${credentials.baseUrl}${endpoint}`;
+    const requestedCount = clampInt(Number(payload.n || 1), 1, 4);
 
-    const upstreamResponse =
-      files.length > 0
-        ? await forwardEditRequest(upstreamUrl, credentials.apiKey, payload, files, fields)
-        : await forwardGenerationRequest(upstreamUrl, credentials.apiKey, payload);
+    const result = await requestImagesWithCount(
+      upstreamUrl,
+      credentials.apiKey,
+      payload,
+      requestedCount,
+      files,
+      fields
+    );
 
-    const text = await upstreamResponse.text();
-    const data = parseJsonSafely(text);
-
-    if (!upstreamResponse.ok) {
-      res.status(upstreamResponse.status).json({
-        message: extractErrorMessage(data) || text || "上游图片接口请求失败",
-        upstreamStatus: upstreamResponse.status,
-        upstream: data || text
+    res.json({
+      mode: files.length > 0 ? "image-to-image" : "text-to-image",
+      images: result.images,
+      raw: result.raw
+    });
+  } catch (error) {
+    if (error instanceof UpstreamHttpError) {
+      res.status(error.status).json({
+        message: error.message,
+        upstreamStatus: error.status,
+        upstream: error.upstream
       });
       return;
     }
 
-    res.json({
-      mode: files.length > 0 ? "image-to-image" : "text-to-image",
-      images: normalizeImageResponse(data),
-      raw: data
-    });
-  } catch (error) {
     const message = error instanceof Error ? error.message : "服务器处理失败";
     res.status(500).json({ message });
   }
@@ -151,6 +169,79 @@ function buildPayload(fields: UnknownRecord, prompt: string): UpstreamRequest {
   }
 
   return dropEmptyValues(payload);
+}
+
+async function requestImagesWithCount(
+  url: string,
+  apiKey: string,
+  payload: UpstreamRequest,
+  requestedCount: number,
+  files: Express.Multer.File[],
+  fields: UnknownRecord
+): Promise<ImageRequestResult> {
+  const images: NormalizedImage[] = [];
+  const raw: unknown[] = [];
+  const maxAttempts = requestedCount + 2;
+  let attempts = 0;
+  let emptyResponses = 0;
+
+  while (images.length < requestedCount && attempts < maxAttempts) {
+    attempts += 1;
+    const singlePayload: UpstreamRequest = { ...payload, n: 1 };
+    const result = await requestOneImageBatch(url, apiKey, singlePayload, files, fields);
+
+    raw.push(result.raw);
+
+    if (result.images.length === 0) {
+      emptyResponses += 1;
+      if (emptyResponses >= 2) {
+        break;
+      }
+      continue;
+    }
+
+    emptyResponses = 0;
+    images.push(...result.images);
+  }
+
+  if (images.length < requestedCount) {
+    throw new Error(`图片接口只返回 ${images.length} 张，未达到本次要求的 ${requestedCount} 张，请稍后重试`);
+  }
+
+  return {
+    images: images.slice(0, requestedCount),
+    raw
+  };
+}
+
+async function requestOneImageBatch(
+  url: string,
+  apiKey: string,
+  payload: UpstreamRequest,
+  files: Express.Multer.File[],
+  fields: UnknownRecord
+) {
+  const response =
+    files.length > 0
+      ? await forwardEditRequest(url, apiKey, payload, files, fields)
+      : await forwardGenerationRequest(url, apiKey, payload);
+
+  const text = await response.text();
+  const data = parseJsonSafely(text);
+  const raw = data ?? text;
+
+  if (!response.ok) {
+    throw new UpstreamHttpError(
+      extractErrorMessage(data) || text || "上游图片接口请求失败",
+      response.status,
+      raw
+    );
+  }
+
+  return {
+    images: normalizeImageResponse(data),
+    raw
+  };
 }
 
 async function forwardGenerationRequest(url: string, apiKey: string, payload: UpstreamRequest) {
