@@ -5,17 +5,52 @@ const { pathToFileURL } = require("node:url");
 
 app.setName("稳如狗生图工作台V1.0");
 
-let mainWindow;
+let mainWindow = null;
+let serverPort = null;
+let serverReadyPromise = null;
 
 app.whenReady().then(async () => {
-  const port = await findAvailablePort(8787);
-  process.env.PORT = String(port);
-  process.env.ELECTRON_DESKTOP = "1";
+  await createMainWindow();
+});
 
-  await import(pathToFileURL(path.join(__dirname, "..", "dist-server", "index.js")).href);
-  await waitForServer(port);
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") {
+    app.quit();
+  }
+});
 
-  mainWindow = new BrowserWindow({
+app.on("activate", async () => {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    await createMainWindow();
+    return;
+  }
+
+  mainWindow.show();
+  mainWindow.focus();
+});
+
+async function ensureLocalServer() {
+  if (serverReadyPromise) {
+    return serverReadyPromise;
+  }
+
+  serverReadyPromise = (async () => {
+    const port = await findAvailablePort(8787);
+    serverPort = port;
+    process.env.PORT = String(port);
+    process.env.ELECTRON_DESKTOP = "1";
+
+    await import(pathToFileURL(path.join(__dirname, "..", "dist-server", "index.js")).href);
+    await waitForServer(port);
+    return port;
+  })();
+
+  return serverReadyPromise;
+}
+
+async function createMainWindow() {
+  const port = serverPort || (await ensureLocalServer());
+  const window = new BrowserWindow({
     width: 1280,
     height: 820,
     minWidth: 980,
@@ -31,34 +66,31 @@ app.whenReady().then(async () => {
     }
   });
 
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+  mainWindow = window;
+
+  window.on("closed", () => {
+    if (mainWindow === window) {
+      mainWindow = null;
+    }
+  });
+
+  window.webContents.setWindowOpenHandler(({ url }) => {
     if (isExternalUrl(url)) {
       shell.openExternal(url);
     }
     return { action: "deny" };
   });
 
-  mainWindow.webContents.on("will-navigate", (event, url) => {
+  window.webContents.on("will-navigate", (event, url) => {
     if (isExternalUrl(url)) {
       event.preventDefault();
       shell.openExternal(url);
     }
   });
 
-  await mainWindow.loadURL(`http://127.0.0.1:${port}/`);
-});
-
-app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") {
-    app.quit();
-  }
-});
-
-app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0 && mainWindow) {
-    mainWindow.show();
-  }
-});
+  await window.loadURL(`http://127.0.0.1:${port}/`);
+  return window;
+}
 
 function isExternalUrl(url) {
   return /^https?:\/\//i.test(url) && !url.startsWith("http://127.0.0.1:");

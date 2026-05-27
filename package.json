@@ -1,7 +1,7 @@
 {
   "name": "gpt-image-studio",
   "private": true,
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "稳如狗生图工作台V1.0",
   "author": "稳如狗",
   "type": "module",
