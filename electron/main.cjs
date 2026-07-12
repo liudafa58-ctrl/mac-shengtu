@@ -3,7 +3,7 @@ const net = require("node:net");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 
-app.setName("稳如狗生图工作台V1.0");
+app.setName("刘辉生图软件工作台");
 
 let mainWindow = null;
 let serverPort = null;
@@ -55,7 +55,7 @@ async function createMainWindow() {
     height: 820,
     minWidth: 980,
     minHeight: 680,
-    title: "稳如狗生图工作台V1.0",
+    title: "刘辉生图软件工作台",
     icon: path.join(__dirname, "..", "build", "icon.ico"),
     backgroundColor: "#111613",
     autoHideMenuBar: true,

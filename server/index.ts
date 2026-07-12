@@ -7,8 +7,8 @@ import { request as requestHttps } from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const FIXED_BASE_URL = "https://api.wenrugouai.cn/";
-const FIXED_MODEL = "gpt-image-2";
+const DEFAULT_BASE_URL = process.env.IMAGE_API_BASE_URL || "https://api.wenrugouai.cn/";
+const DEFAULT_MODEL = "gpt-image-2";
 const PORT = Number(process.env.PORT || 8787);
 const MAX_UPLOAD_MB = 25;
 
@@ -73,11 +73,54 @@ app.use(express.urlencoded({ extended: false, limit: "1mb" }));
 
 app.get("/api/config", (_req, res) => {
   res.json({
-    defaultBaseUrl: normalizeBaseUrl(FIXED_BASE_URL),
-    defaultModel: FIXED_MODEL,
-    hasServerBaseUrl: true,
+    defaultBaseUrl: normalizeBaseUrl(DEFAULT_BASE_URL),
+    defaultModel: DEFAULT_MODEL,
+    hasServerBaseUrl: false,
     hasServerKey: Boolean(process.env.IMAGE_API_KEY)
   });
+});
+
+app.post("/api/models", async (req, res) => {
+  try {
+    const fields = (req.body || {}) as UnknownRecord;
+    const credentials = readCredentials(fields);
+    const response = await fetch(`${credentials.baseUrl}/models`, {
+      headers: {
+        Authorization: `Bearer ${credentials.apiKey}`
+      }
+    });
+    const text = await response.text();
+    const data = parseJsonSafely(text);
+    const raw = data ?? text;
+
+    if (!response.ok) {
+      throw new UpstreamHttpError(
+        extractErrorMessage(data) || text || "获取模型失败",
+        response.status,
+        raw
+      );
+    }
+
+    const models = normalizeModelResponse(data);
+    if (models.length === 0) {
+      res.status(502).json({ message: "接口未返回可用模型" });
+      return;
+    }
+
+    res.json({ models });
+  } catch (error) {
+    if (error instanceof UpstreamHttpError) {
+      res.status(error.status).json({
+        message: error.message,
+        upstreamStatus: error.status,
+        upstream: error.upstream
+      });
+      return;
+    }
+
+    const message = error instanceof Error ? error.message : "获取模型失败";
+    res.status(500).json({ message });
+  }
 });
 
 app.post("/api/images", upload.array("images", 8), async (req, res) => {
@@ -139,7 +182,7 @@ app.listen(PORT, () => {
 });
 
 function readCredentials(fields: UnknownRecord) {
-  const baseUrl = normalizeBaseUrl(FIXED_BASE_URL);
+  const baseUrl = normalizeBaseUrl(readField(fields.baseUrl) || process.env.IMAGE_API_BASE_URL || DEFAULT_BASE_URL);
   const apiKey = process.env.IMAGE_API_KEY || readField(fields.apiKey);
 
   if (!apiKey) {
@@ -155,7 +198,7 @@ function buildPayload(fields: UnknownRecord, prompt: string): UpstreamRequest {
   const n = clampInt(Number(readField(fields.n) || 1), 1, 4);
 
   const payload: UpstreamRequest = {
-    model: FIXED_MODEL,
+    model: readField(fields.model) || DEFAULT_MODEL,
     prompt,
     size: readField(fields.size) || "1024x1024",
     quality: readField(fields.quality) || "auto",
@@ -449,7 +492,7 @@ function uniqueValues(values: string[]) {
 function normalizeBaseUrl(value: string) {
   let next = value.trim();
   if (!next) {
-    next = FIXED_BASE_URL;
+    next = DEFAULT_BASE_URL;
   }
 
   if (!/^https?:\/\//i.test(next)) {
@@ -480,6 +523,36 @@ function normalizeImageResponse(data: unknown): NormalizedImage[] {
       revisedPrompt: readField(item.revised_prompt)
     }))
     .filter((item) => item.b64Json || item.url);
+}
+
+function normalizeModelResponse(data: unknown): string[] {
+  if (!data) {
+    return [];
+  }
+
+  const record = typeof data === "object" && !Array.isArray(data) ? (data as UnknownRecord) : null;
+  const candidates = Array.isArray(data)
+    ? data
+    : Array.isArray(record?.data)
+      ? record.data
+      : Array.isArray(record?.models)
+        ? record.models
+        : [];
+
+  return candidates
+    .map((item) => {
+      if (typeof item === "string") {
+        return item.trim();
+      }
+      if (!item || typeof item !== "object") {
+        return "";
+      }
+
+      const model = item as UnknownRecord;
+      return readField(model.id) || readField(model.model) || readField(model.name);
+    })
+    .filter((model, index, models) => Boolean(model) && models.indexOf(model) === index)
+    .sort((left, right) => left.localeCompare(right));
 }
 
 function parseJsonSafely(text: string): unknown {

@@ -126,16 +126,18 @@ button {
   width: 56px;
   height: 56px;
   border-radius: 8px;
-  overflow: hidden;
-  background: var(--panel-solid);
+  display: grid;
+  place-items: center;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.18), transparent 42%),
+    linear-gradient(135deg, #0f766e 0%, #2563eb 62%, #c2410c 100%);
   border: 1px solid var(--line);
-}
-
-.brand-mark img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
+  color: #ffffff;
+  font-size: 17px;
+  font-weight: 900;
+  line-height: 1;
+  text-align: center;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
 }
 
 .brand h1,
@@ -217,6 +219,7 @@ button {
 }
 
 .field span,
+.field > label,
 .check-row {
   color: var(--label);
   font-size: 13px;
@@ -252,6 +255,53 @@ button {
 .field input:disabled {
   color: var(--input-disabled-color);
   background: var(--input-disabled-bg);
+}
+
+.model-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.fetch-models-button {
+  min-width: 108px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid var(--teal);
+  border-radius: 6px;
+  color: #ffffff;
+  background: var(--teal);
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.fetch-models-button:hover {
+  background: var(--teal-dark);
+}
+
+.fetch-models-button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.model-message {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.model-message.success {
+  color: var(--teal-dark);
+}
+
+.model-message.error {
+  color: var(--danger);
 }
 
 .grid-two {
@@ -1027,6 +1077,10 @@ button {
   }
 
   .grid-two {
+    grid-template-columns: 1fr;
+  }
+
+  .model-control {
     grid-template-columns: 1fr;
   }
 

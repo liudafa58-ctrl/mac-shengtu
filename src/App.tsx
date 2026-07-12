@@ -13,6 +13,7 @@ import {
   Loader2,
   Moon,
   Palette,
+  RefreshCw,
   RotateCcw,
   Settings2,
   Sparkles,
@@ -78,6 +79,10 @@ type ApiImagesResponse = {
   raw?: unknown;
 };
 
+type ApiModelsResponse = {
+  models?: string[];
+};
+
 type GallerySaverPlugin = {
   saveImage(options: {
     base64?: string;
@@ -122,15 +127,15 @@ const mimeByFormat: Record<string, string> = {
   webp: "image/webp"
 };
 
-const FIXED_BASE_URL = "https://api.wenrugouai.cn/v1";
-const FIXED_MODEL = "gpt-image-2";
+const DEFAULT_BASE_URL = "https://api.wenrugouai.cn/v1";
+const DEFAULT_MODEL = "gpt-image-2";
 const IS_NATIVE_APP = Capacitor.isNativePlatform();
 const IS_ANDROID_NATIVE = IS_NATIVE_APP && Capacitor.getPlatform() === "android";
 const GallerySaver = registerPlugin<GallerySaverPlugin>("GallerySaver");
 
 const translations = {
   zh: {
-    appTitle: "稳如狗生图工作台V1.0",
+    appTitle: "刘辉生图软件工作台",
     settingsAria: "生成设置",
     apiSection: "接口",
     relayBaseUrl: "中转站 Base URL",
@@ -140,6 +145,12 @@ const translations = {
     rememberKey: "本机记住密钥",
     params: "参数",
     model: "模型",
+    fetchModels: "获取模型",
+    fetchingModels: "获取中",
+    modelPlaceholder: "输入模型名或点击获取模型",
+    modelsLoaded: (count: number) => `已获取 ${count} 个模型`,
+    modelsEmpty: "接口未返回可用模型",
+    modelCredentialsRequired: "请先填写 Base URL 和 API Key",
     size: "尺寸",
     clarity: "清晰度",
     quality: "质量",
@@ -214,7 +225,7 @@ const translations = {
     outputAlt: (index: number) => `生成图 ${index + 1}`
   },
   en: {
-    appTitle: "Wenrugou Image Studio V1.0",
+    appTitle: "Liu Hui Image Studio",
     settingsAria: "Generation settings",
     apiSection: "API",
     relayBaseUrl: "Relay Base URL",
@@ -224,6 +235,12 @@ const translations = {
     rememberKey: "Remember key on this device",
     params: "Parameters",
     model: "Model",
+    fetchModels: "Fetch models",
+    fetchingModels: "Fetching",
+    modelPlaceholder: "Enter a model or fetch models",
+    modelsLoaded: (count: number) => `${count} models loaded`,
+    modelsEmpty: "No models returned by the API",
+    modelCredentialsRequired: "Enter the Base URL and API Key first",
     size: "Size",
     clarity: "Clarity",
     quality: "Quality",
@@ -388,7 +405,7 @@ const sizePresets = [
 ] as const;
 
 const defaultSettings: StoredSettings = {
-  baseUrl: "https://api.wenrugouai.cn/v1",
+  baseUrl: DEFAULT_BASE_URL,
   model: "gpt-image-2",
   size: "square",
   clarity: "original",
@@ -401,11 +418,29 @@ const defaultSettings: StoredSettings = {
   rememberKey: false
 };
 
+function normalizeBaseUrl(value: string) {
+  let next = value.trim();
+  if (!next) {
+    next = DEFAULT_BASE_URL;
+  }
+
+  if (!/^https?:\/\//i.test(next)) {
+    next = `https://${next}`;
+  }
+
+  next = next.replace(/\/+$/, "");
+  if (!/\/v\d+$/i.test(next)) {
+    next = `${next}/v1`;
+  }
+
+  return next;
+}
+
 function normalizeSettings(parsed: Partial<StoredSettings>): StoredSettings {
   const next = {
     ...defaultSettings,
     ...parsed,
-    baseUrl: defaultSettings.baseUrl,
+    baseUrl: normalizeBaseUrl(parsed.baseUrl || defaultSettings.baseUrl),
     apiKey: undefined
   };
 
@@ -502,9 +537,9 @@ async function fetchImageObjectUrl(src: string) {
 
 function getNativeServerConfig(): ServerConfig {
   return {
-    defaultBaseUrl: FIXED_BASE_URL,
-    defaultModel: FIXED_MODEL,
-    hasServerBaseUrl: true,
+    defaultBaseUrl: DEFAULT_BASE_URL,
+    defaultModel: DEFAULT_MODEL,
+    hasServerBaseUrl: false,
     hasServerKey: false
   };
 }
@@ -523,6 +558,38 @@ async function requestServerImages(form: FormData) {
   return data as ApiImagesResponse;
 }
 
+async function requestServerModels(baseUrl: string, apiKey: string) {
+  const response = await fetch("/api/models", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ baseUrl, apiKey })
+  });
+  const data = (await response.json()) as ApiModelsResponse & { message?: string };
+
+  if (!response.ok) {
+    throw new Error(data.message || "获取模型失败");
+  }
+
+  return data.models || [];
+}
+
+async function requestNativeModels(baseUrl: string, apiKey: string) {
+  const response = await fetch(`${normalizeBaseUrl(baseUrl)}/models`, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`
+    }
+  });
+  const data = await readApiResponse(response);
+
+  if (!response.ok) {
+    throw new Error(extractApiErrorMessage(data) || "获取模型失败");
+  }
+
+  return normalizeApiModels(data);
+}
+
 async function requestNativeImages(
   prompt: string,
   apiKey: string,
@@ -532,7 +599,7 @@ async function requestNativeImages(
 ) {
   const payload = buildNativePayload(prompt, settings, size);
   const endpoint = files.length > 0 ? "/images/edits" : "/images/generations";
-  const url = `${FIXED_BASE_URL}${endpoint}`;
+  const url = `${normalizeBaseUrl(settings.baseUrl)}${endpoint}`;
   const requestedCount = clampImageCount(settings.n);
 
   return requestNativeImagesWithCount(url, apiKey, payload, requestedCount, files, settings.imageFieldName);
@@ -655,7 +722,7 @@ async function requestNativeEditImage(
 
 function buildNativePayload(prompt: string, settings: StoredSettings, size: string) {
   const payload: Record<string, string | number> = {
-    model: FIXED_MODEL,
+    model: settings.model.trim() || DEFAULT_MODEL,
     prompt,
     size,
     quality: settings.quality || "auto",
@@ -707,6 +774,36 @@ function normalizeApiImages(data: unknown): ApiImageItem[] {
       revisedPrompt: readString(item.revised_prompt)
     }))
     .filter((item) => item.b64Json || item.url);
+}
+
+function normalizeApiModels(data: unknown): string[] {
+  if (!data) {
+    return [];
+  }
+
+  const record = typeof data === "object" && !Array.isArray(data) ? (data as Record<string, unknown>) : null;
+  const items = Array.isArray(data)
+    ? data
+    : Array.isArray(record?.data)
+      ? record.data
+      : Array.isArray(record?.models)
+        ? record.models
+        : [];
+
+  return items
+    .map((item) => {
+      if (typeof item === "string") {
+        return item.trim();
+      }
+      if (!item || typeof item !== "object") {
+        return "";
+      }
+
+      const model = item as Record<string, unknown>;
+      return readString(model.id) || readString(model.model) || readString(model.name);
+    })
+    .filter((model, index, models) => Boolean(model) && models.indexOf(model) === index)
+    .sort((left, right) => left.localeCompare(right));
 }
 
 function extractApiErrorMessage(data: unknown) {
@@ -951,6 +1048,9 @@ function App() {
   const [prompt, setPrompt] = useState("");
   const [settings, setSettings] = useState<StoredSettings>(defaultSettings);
   const [apiKey, setApiKey] = useState("");
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [modelMessage, setModelMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [files, setFiles] = useState<File[]>([]);
   const [outputs, setOutputs] = useState<OutputImage[]>([]);
   const [previewImage, setPreviewImage] = useState<OutputImage | null>(null);
@@ -1043,8 +1143,8 @@ function App() {
       setServerConfig(config);
       setSettings((current) => ({
         ...current,
-        baseUrl: config.defaultBaseUrl,
-        model: config.defaultModel
+        baseUrl: current.baseUrl || config.defaultBaseUrl,
+        model: current.model || config.defaultModel
       }));
       setStatus({ kind: "ready" });
       return;
@@ -1056,7 +1156,7 @@ function App() {
         setServerConfig(config);
         setSettings((current) => ({
           ...current,
-          baseUrl: config.defaultBaseUrl,
+          baseUrl: current.baseUrl || config.defaultBaseUrl,
           model: current.model || config.defaultModel
         }));
       })
@@ -1089,12 +1189,50 @@ function App() {
   const usesServerKey = Boolean(serverConfig?.hasServerKey);
   const canSubmit =
     prompt.trim().length > 0 &&
+    settings.baseUrl.trim().length > 0 &&
+    settings.model.trim().length > 0 &&
     !isGenerating &&
     (usesServerKey || apiKey.trim().length > 0) &&
     (mode === "text" || files.length > 0);
 
   function updateSetting<Key extends keyof StoredSettings>(key: Key, value: StoredSettings[Key]) {
     setSettings((current) => ({ ...current, [key]: value }));
+  }
+
+  async function handleFetchModels() {
+    const baseUrl = settings.baseUrl.trim();
+    const key = apiKey.trim();
+
+    if (!baseUrl || (!usesServerKey && !key)) {
+      setModelMessage({ kind: "error", text: text.modelCredentialsRequired });
+      return;
+    }
+
+    setIsFetchingModels(true);
+    setModelMessage(null);
+
+    try {
+      const models = IS_NATIVE_APP
+        ? await requestNativeModels(baseUrl, key)
+        : await requestServerModels(baseUrl, key);
+
+      if (models.length === 0) {
+        throw new Error(text.modelsEmpty);
+      }
+
+      setAvailableModels(models);
+      setSettings((current) => ({
+        ...current,
+        model: models.includes(current.model.trim()) ? current.model.trim() : models[0]
+      }));
+      setModelMessage({ kind: "success", text: text.modelsLoaded(models.length) });
+    } catch (fetchError) {
+      const message = fetchError instanceof Error ? fetchError.message : text.modelsEmpty;
+      setAvailableModels([]);
+      setModelMessage({ kind: "error", text: message });
+    } finally {
+      setIsFetchingModels(false);
+    }
   }
 
   function addFiles(fileList: FileList | File[]) {
@@ -1164,7 +1302,9 @@ function App() {
 
     const form = new FormData();
     form.set("prompt", promptText);
+    form.set("baseUrl", settings.baseUrl.trim());
     form.set("apiKey", apiKey.trim());
+    form.set("model", settings.model.trim());
     form.set("size", selectedSizePreset.apiSize);
     form.set("quality", settings.quality);
     form.set("background", settings.background);
@@ -1230,7 +1370,7 @@ function App() {
   async function downloadImage(image: OutputImage, index: number) {
     const imageFormat = image.format || settings.outputFormat;
     const extension = imageFormat === "jpeg" ? "jpg" : imageFormat;
-    const fileName = `wenrugou-image-${image.clarity}-${Date.now()}-${index + 1}.${extension}`;
+    const fileName = `liuhui-image-${image.clarity}-${Date.now()}-${index + 1}.${extension}`;
 
     try {
       if (IS_ANDROID_NATIVE) {
@@ -1267,8 +1407,8 @@ function App() {
     <main className="app-shell">
       <aside className="control-rail" aria-label={text.settingsAria}>
         <div className="brand">
-          <div className="brand-mark">
-            <img src="/wenrugou-icon.png" alt="" aria-hidden="true" />
+          <div className="brand-mark" aria-hidden="true">
+            刘辉
           </div>
           <div>
             <h1>{text.appTitle}</h1>
@@ -1289,8 +1429,12 @@ function App() {
             <span>{text.relayBaseUrl}</span>
             <input
               value={settings.baseUrl}
-              readOnly
-              disabled
+              onChange={(event) => {
+                updateSetting("baseUrl", event.target.value);
+                setAvailableModels([]);
+                setModelMessage(null);
+              }}
+              onBlur={(event) => updateSetting("baseUrl", normalizeBaseUrl(event.target.value))}
               placeholder="https://api.wenrugouai.cn/v1"
               autoComplete="off"
             />
@@ -1302,7 +1446,11 @@ function App() {
             </span>
             <input
               value={apiKey}
-              onChange={(event) => setApiKey(event.target.value)}
+              onChange={(event) => {
+                setApiKey(event.target.value);
+                setAvailableModels([]);
+                setModelMessage(null);
+              }}
               placeholder={usesServerKey ? text.serverKeyPlaceholder : "sk-..."}
               type="password"
               autoComplete="off"
@@ -1327,15 +1475,29 @@ function App() {
             <h2>{text.params}</h2>
           </div>
 
-          <label className="field">
-            <span>{text.model}</span>
-            <input
-              value={settings.model}
-              readOnly
-              disabled
-              placeholder="gpt-image-2"
-            />
-          </label>
+          <div className="field">
+            <label htmlFor="model-input">{text.model}</label>
+            <div className="model-control">
+              <input
+                id="model-input"
+                list="available-models"
+                value={settings.model}
+                onChange={(event) => updateSetting("model", event.target.value)}
+                placeholder={text.modelPlaceholder}
+                autoComplete="off"
+              />
+              <button type="button" className="fetch-models-button" onClick={handleFetchModels} disabled={isFetchingModels}>
+                {isFetchingModels ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
+                {isFetchingModels ? text.fetchingModels : text.fetchModels}
+              </button>
+            </div>
+            <datalist id="available-models">
+              {availableModels.map((model) => (
+                <option key={model} value={model} />
+              ))}
+            </datalist>
+            {modelMessage && <small className={`model-message ${modelMessage.kind}`}>{modelMessage.text}</small>}
+          </div>
 
           <div className="grid-two">
             <label className="field">
